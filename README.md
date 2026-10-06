@@ -1,4 +1,5 @@
-# pokebot [OUTDATED]
+# pokebot [OUTDATED] 
+![charizard](https://play.pokemonshowdown.com/sprites/ani/charizard.gif)
 
 RL agent for Pokémon Showdown singles (default: `gen9randombattle`), built on
 [poke-env](https://github.com/hsahovic/poke-env) 0.16.
