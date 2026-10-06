@@ -1,0 +1,4 @@
+poke-env>=0.16.1
+gymnasium>=1.0
+numpy
+torch
