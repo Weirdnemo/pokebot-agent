@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--data", nargs="+", required=True)
     ap.add_argument("--init", default=None, help="start from this checkpoint (e.g. checkpoints/bc.pt)")
     ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--patience", type=int, default=4, help="stop after this many epochs without validation improvement")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--wd", type=float, default=1e-4)
@@ -100,7 +101,18 @@ def main():
             ent_s = dist.entropy()[m].mean().item()
         return pl.item(), vl.item(), top1_search, top1_pick, ent_t, ent_s
 
-    best = 1e9
+    # Reference points for reading the numbers below.
+    m_va = multi[va]
+    ceiling = (D["policy"][va].argmax(-1) == D["act"][va])[m_va].mean() if m_va.any() else float("nan")
+    chance = (1.0 / D["n_legal"][va][m_va]).mean() if m_va.any() else float("nan")
+    print(f"reference: random-legal agreement ~{chance:.3f}; a perfect copy of the argmax would agree "
+          f"with Foul Play's sampled pick {ceiling:.3f} of the time")
+    if len(va):
+        pl, vl, t1s, t1p, et, es = val_metrics()
+        print(f"epoch  0 (before training) | val policy_ce={pl:.3f} value_mse={vl:.3f} "
+              f"agree_argmax={t1s:.3f} agree_pick={t1p:.3f} H_teacher={et:.2f} H_student={es:.2f}", flush=True)
+
+    best, bad = 1e9, 0
     for ep in range(args.epochs):
         rng.shuffle(tr)
         tot = 0.0
@@ -116,8 +128,13 @@ def main():
                   f"value_mse={vl:.3f} agree_argmax={t1s:.3f} agree_pick={t1p:.3f} "
                   f"H_teacher={et:.2f} H_student={es:.2f}", flush=True)
             if pl < best:
-                best = pl
+                best, bad = pl, 0
                 torch.save(net.state_dict(), f"{args.out}/fp_best.pt")
+            else:
+                bad += 1
+                if bad >= args.patience:
+                    print(f"early stop: no validation improvement for {args.patience} epochs")
+                    break
         torch.save(net.state_dict(), f"{args.out}/fp.pt")
     print(f"saved {args.out}/fp.pt (last epoch) and fp_best.pt (lowest validation policy loss)")
 
