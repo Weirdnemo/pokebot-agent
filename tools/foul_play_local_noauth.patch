@@ -1,0 +1,22 @@
+diff --git a/fp/websocket_client.py b/fp/websocket_client.py
+index d49b726..0dd13a6 100644
+--- a/fp/websocket_client.py
++++ b/fp/websocket_client.py
+@@ -92,6 +92,17 @@ class PSWebsocketClient:
+ 
+         guest_login = self.password is None
+ 
++        # LOCAL TEST PATCH (not upstream): a local Showdown server started with
++        # --no-security accepts any name with an empty assertion, so skip the call to the
++        # official login service. Enabled only when FP_LOCAL_NO_AUTH=1.
++        import os
++
++        if os.environ.get("FP_LOCAL_NO_AUTH") == "1":
++            await self.send_message("", ["/trn " + self.username + ",0,"])
++            logger.info("Local no-auth login")
++            await asyncio.sleep(3)
++            return self.username
++
+         if guest_login:
+             response = requests.post(
+                 self.login_uri,

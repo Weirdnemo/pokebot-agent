@@ -28,7 +28,7 @@ def wilson(w: int, n: int, z: float = 1.96):
     d = 1 + z * z / n
     c = p + z * z / (2 * n)
     h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return (c - h) / d, (c + h) / d
+    return max(0.0, (c - h) / d), min(1.0, (c + h) / d)
 
 
 def make_ckpt_player(path: str, fmt: str, acct=None):
@@ -78,10 +78,40 @@ async def main():
     else:
         player = BOTS[args.bot](battle_format=args.format, account_configuration=acct)
 
+    async def announce_ready():
+        # Challenges sent before we are logged in are silently lost, and the challenger then
+        # waits forever. So tell the user when it is safe to start the external bot.
+        while not player.ps_client.logged_in.is_set():
+            await asyncio.sleep(0.25)
+        if args.mode == "accept":
+            print(f"[ready] {args.name} is logged in and waiting for {args.n} challenge(s) from "
+                  f"{args.opponent}. Start the external bot NOW.", flush=True)
+        else:
+            print(f"[ready] {args.name} is logged in; challenging {args.opponent} (it must already "
+                  f"be running and waiting).", flush=True)
+
+        # Progress: announce each battle when it starts (with a URL you can open to watch it)
+        # and each time one finishes.
+        seen, last_done = set(), -1
+        while True:
+            await asyncio.sleep(2)
+            for tag, b in list(player.battles.items()):
+                if tag not in seen:
+                    seen.add(tag)
+                    print(f"[battle] started {tag} -> watch at http://localhost:8000/{tag}", flush=True)
+            done = player.n_finished_battles
+            if done != last_done:
+                last_done = done
+                if done:
+                    print(f"[progress] {done}/{args.n} finished, {player.n_won_battles} won", flush=True)
+
+    ready_task = asyncio.create_task(announce_ready())
+
     if args.mode == "challenge":
         await player.send_challenges(args.opponent, n_challenges=args.n)
     else:
         await player.accept_challenges(args.opponent, args.n)
+    ready_task.cancel()
     w, n = player.n_won_battles, player.n_finished_battles
     lo, hi = wilson(w, n)
     print(f"{args.bot} vs {args.opponent}: {w}/{n} = {w / max(n, 1):.2f}  (95% CI {lo:.2f}-{hi:.2f})")
