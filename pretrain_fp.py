@@ -30,7 +30,7 @@ def load(paths):
         b = d["battle"].astype(np.int64) + off
         off = b.max() + 1
         parts.append(dict(obs=d["obs"], mask=d["mask"], act=d["act"].astype(np.int64),
-                          policy=d["policy"], n_legal=d["n_legal"], battle=b,
+                          policy=d["policy"], n_legal=d["n_legal"], turn=d["turn"], battle=b,
                           outcome=d["outcome"].astype(np.float32), meta=str(d["meta"])))
         print(f"{p}: {len(d['obs'])} decisions, {len(np.unique(b))} battles, meta={parts[-1]['meta']}")
     return {k: np.concatenate([q[k] for q in parts]) for k in parts[0] if k != "meta"}
