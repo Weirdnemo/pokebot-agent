@@ -16,8 +16,7 @@ import argparse
 import numpy as np
 import torch
 
-from pokebot.encoder import OBS_DIM
-from pokebot.model import ActorCritic
+from pokebot.model import load_actor_critic
 from pretrain_fp import load
 
 
@@ -44,9 +43,8 @@ def main():
     sel = np.array([b in val_b for b in D["battle"]]) & (D["n_legal"] > 1)
     X, M, P, N, T = D["obs"][sel], D["mask"][sel], D["policy"][sel], D["n_legal"][sel], D["turn"][sel]
 
-    net = ActorCritic(OBS_DIM, M.shape[1])
-    net.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
-    net.eval()
+    net, obs_dim = load_actor_critic(args.ckpt, M.shape[1])
+    assert obs_dim == X.shape[1], f"checkpoint expects {obs_dim} inputs but the data has {X.shape[1]}"
     with torch.no_grad():
         dist, _ = net(torch.as_tensor(X), torch.as_tensor(M, dtype=torch.float32))
     pred = dist.probs.argmax(-1).numpy()

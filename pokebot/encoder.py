@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 from poke_env.battle import Battle, Move, MoveCategory, Pokemon, PokemonType, SideCondition, Status, Weather
 
-from .damage import est_speed, move_damage_frac, stab_threat
+from .damage import est_speed, move_damage_frac, stab_threat, tera_stab
 
 TYPES = list(PokemonType)  # includes THREE_QUESTION_MARKS; fine as padding
 STATUSES = list(Status)
@@ -227,3 +227,99 @@ MATCHUP_DIM = (
 OBS_DIM = (
     2 * N_TEAM * MON_DIM + N_MOVES * MOVE_DIM + 2 * BOOST_DIM + FIELD_DIM + 4 + MATCHUP_DIM
 )
+
+
+# ---------------------------------------------------------------------------------------
+# v3: v2 + Terastallization features (the v2 observation only had "can tera" and
+# "is terastallized"; the 2026-10-08 error analysis showed the network practically never
+# terastallizes because it could not see its own or the opponent's Tera types).
+# ---------------------------------------------------------------------------------------
+N_T = len(TYPES)
+TERA_DIM = (
+    N_TEAM * N_T  # each own mon's Tera type (known from the request)
+    + N_T  # opponent active's Tera type (known only once it has terastallized)
+    + 3  # any own mon terastallized, any opponent mon terastallized, active's Tera type is one of its types
+    + N_MOVES * 2  # own active moves: damage if we terastallize now, and the gain over normal damage
+    + N_MOVES + 1  # opponent's revealed moves vs our active after terastallizing; best-hit reduction
+)
+OBS_DIM_V3 = OBS_DIM + TERA_DIM
+
+
+def _tera_onehot(t) -> np.ndarray:
+    return _onehot(TYPES.index(t), N_T) if (t is not None and t in TYPES) else np.zeros(N_T, np.float32)
+
+
+def own_tera_types(battle: Battle) -> dict:
+    """Our mons' Tera types, keyed like `battle.team`.
+
+    poke-env 0.16.1 does not read them from the request (`side.pokemon[i].teraType`), so we
+    take them from the raw request it keeps in `battle.last_request`; if that is missing we
+    fall back to whatever poke-env knows (usually nothing before we terastallize)."""
+    out: dict = {}
+    try:
+        for p in (battle.last_request or {}).get("side", {}).get("pokemon", []):
+            if p.get("teraType"):
+                out[p["ident"]] = PokemonType.from_name(p["teraType"])
+    except Exception:
+        pass
+    for k, m in battle.team.items():
+        if k not in out and m.tera_type is not None:
+            out[k] = m.tera_type
+    return out
+
+
+def encode_tera(battle: Battle) -> np.ndarray:
+    me, opp = battle.active_pokemon, battle.opponent_active_pokemon
+    tmap = own_tera_types(battle)
+    keys = list(battle.team.keys())[:N_TEAM]
+    my_tt = next((tmap.get(k) for k, m in battle.team.items() if m is me), None) if me is not None else None
+    out: list = []
+    for i in range(N_TEAM):
+        out += list(_tera_onehot(tmap.get(keys[i]) if i < len(keys) else None))
+    out += list(_tera_onehot(opp.tera_type if (opp is not None and getattr(opp, "is_terastallized", False)) else None))
+    own_done = any(getattr(m, "is_terastallized", False) for m in battle.team.values())
+    opp_done = any(getattr(m, "is_terastallized", False) for m in battle.opponent_team.values())
+    same = 0.0
+    if me is not None and my_tt is not None:
+        same = float(my_tt in [t for t in me.types if t is not None])
+    out += [float(own_done), float(opp_done), same]
+
+    can = (me is not None and opp is not None and bool(battle.can_tera)
+           and my_tt is not None and not getattr(me, "is_terastallized", False))
+    my_moves = list(me.moves.values())[:N_MOVES] if me is not None else []
+    my_moves += [None] * (N_MOVES - len(my_moves))
+    for mv in my_moves:
+        if can and mv is not None:
+            d0 = move_damage_frac(mv, me, opp, True)
+            d1 = move_damage_frac(mv, me, opp, True, stab_mod=tera_stab(mv.type, me, my_tt))
+            out += [_clip(d1), _clip(max(d1 - d0, 0.0))]
+        else:
+            out += [0.0, 0.0]
+
+    opp_moves = list(opp.moves.values())[:N_MOVES] if opp is not None else []
+    opp_moves += [None] * (N_MOVES - len(opp_moves))
+    before, after = 0.0, 0.0
+    for mv in opp_moves:
+        if can and mv is not None:
+            d_after = move_damage_frac(mv, opp, me, False, defender_types=[my_tt])
+            before = max(before, move_damage_frac(mv, opp, me, False))
+            after = max(after, d_after)
+            out.append(_clip(d_after))
+        else:
+            out.append(0.0)
+    out.append(_clip(max(before - after, 0.0)) if can else 0.0)
+    return np.asarray(out, dtype=np.float32)
+
+
+def encode_battle_v3(battle: Battle) -> np.ndarray:
+    return np.concatenate([encode_battle(battle), encode_tera(battle)]).astype(np.float32)
+
+
+ENCODERS = {OBS_DIM: encode_battle, OBS_DIM_V3: encode_battle_v3}
+
+
+def encoder_for_dim(dim: int):
+    """Pick the encoder whose output size matches a checkpoint's input layer."""
+    if dim not in ENCODERS:
+        raise ValueError(f"no encoder with output size {dim}; known sizes: {sorted(ENCODERS)}")
+    return ENCODERS[dim]

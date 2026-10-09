@@ -27,3 +27,14 @@ class ActorCritic(nn.Module):
         h = self.body(obs)
         logits = self.pi(h).masked_fill(mask < 0.5, NEG_INF)
         return Categorical(logits=logits), self.v(h).squeeze(-1)
+
+
+def load_actor_critic(path: str, n_actions: int = 26, device="cpu"):
+    """Load a checkpoint, inferring input size and hidden width from the weights.
+    Returns (net, obs_dim)."""
+    sd = torch.load(path, map_location=device)
+    hidden, obs_dim = sd["body.0.weight"].shape
+    net = ActorCritic(obs_dim, n_actions, hidden=hidden).to(device)
+    net.load_state_dict(sd)
+    net.eval()
+    return net, obs_dim

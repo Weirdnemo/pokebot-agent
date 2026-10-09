@@ -34,14 +34,13 @@ def wilson(w: int, n: int, z: float = 1.96):
 def make_ckpt_player(path: str, fmt: str, acct=None):
     import torch
 
-    from pokebot.encoder import encode_battle, OBS_DIM
+    from pokebot.encoder import encoder_for_dim
     from pokebot.env import PokemonEnv
-    from pokebot.model import ActorCritic
+    from pokebot.model import load_actor_critic
 
     n_actions = 26 if "gen9" in fmt else 10
-    net = ActorCritic(OBS_DIM, n_actions)
-    net.load_state_dict(torch.load(path, map_location="cpu"))
-    net.eval()
+    net, obs_dim = load_actor_critic(path, n_actions)
+    encode_battle = encoder_for_dim(obs_dim)
 
     class CkptPlayer(Player):
         def choose_move(self, battle):

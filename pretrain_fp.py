@@ -19,7 +19,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from pokebot.encoder import OBS_DIM
 from pokebot.model import ActorCritic
 
 
@@ -41,6 +40,7 @@ def main():
     ap.add_argument("--data", nargs="+", required=True)
     ap.add_argument("--init", default=None, help="start from this checkpoint (e.g. checkpoints/bc.pt)")
     ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--hidden", type=int, default=512, help="hidden width (must match --init if given)")
     ap.add_argument("--patience", type=int, default=4, help="stop after this many epochs without validation improvement")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=5e-4)
@@ -71,10 +71,18 @@ def main():
     T = lambda a, dt=torch.float32: torch.as_tensor(a, dtype=dt, device=device)
     X, M, P, A, V, MU = (T(D["obs"]), T(D["mask"]), T(D["policy"]), T(D["act"], torch.int64),
                          T(D["outcome"]), T(multi.astype(np.float32)))
-    net = ActorCritic(OBS_DIM, M.shape[1]).to(device)
+    obs_dim = X.shape[1]
+    net = ActorCritic(obs_dim, M.shape[1], hidden=args.hidden).to(device)
     if args.init:
-        net.load_state_dict(torch.load(args.init, map_location=device))
-        print(f"initialised from {args.init}")
+        sd = torch.load(args.init, map_location=device)
+        old_dim = sd["body.0.weight"].shape[1]
+        if old_dim < obs_dim:  # warm start from a checkpoint with fewer input features: new inputs start at 0
+            w = sd["body.0.weight"]
+            sd["body.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], obs_dim - old_dim, device=w.device)], 1)
+            print(f"initialised from {args.init}, padding {obs_dim - old_dim} new input features with zeros")
+        else:
+            print(f"initialised from {args.init}")
+        net.load_state_dict(sd)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.wd)
     Path(args.out).mkdir(exist_ok=True)
 

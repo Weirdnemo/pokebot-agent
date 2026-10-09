@@ -35,10 +35,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gzip
+import json
 import os
+import random
 import re
 import sys
 import threading
+import traceback
 import time
 from pathlib import Path
 
@@ -141,12 +145,19 @@ class QueueWS:
 def make_recorder_class():
     from poke_env.player import Player
 
-    from pokebot.encoder import encode_battle
     from pokebot.env import PokemonEnv
 
     class FPRecorder(Player):
-        def __init__(self, *a, pokemon_battle_fn=None, fp_format="gen9randombattle", **kw):
+        def __init__(self, *a, pokemon_battle_fn=None, fp_format="gen9randombattle",
+                     encode=None, student=None, beta=1.0, greedy=False, **kw):
             super().__init__(*a, **kw)
+            self.encode = encode            # observation encoder used for the stored rows
+            self.student = student          # optional (net, encoder) = our network playing some decisions
+            self.beta = beta                # probability that the TEACHER's action is the one played
+            self.greedy = greedy
+            self.frames: dict[str, list[str]] = {}   # raw room messages per battle (for later re-encoding)
+            self.student_agree = [0, 0]     # [agreements, decisions] between student and teacher
+            self.teacher_played = [0, 0]    # [decisions where the teacher's action was played, total]
             self._fp_battle_fn = pokemon_battle_fn
             self._fp_format = fp_format
             self._fp_ws: dict[str, QueueWS] = {}
@@ -154,6 +165,7 @@ def make_recorder_class():
             self.rows: list[dict] = []
             self.unmapped = 0
             self.fp_errors = 0
+            self.fp_failed: set[str] = set()  # battles where Foul Play crashed (outcome unreliable)
 
         # poke-env must NOT choose moves: Foul Play does. Keep the method abstract-safe.
         def choose_move(self, battle):
@@ -175,7 +187,9 @@ def make_recorder_class():
                     return  # joined mid-battle: cannot follow it
                 ws = QueueWS(self, tag)
                 self._fp_ws[tag] = ws
+                self.frames[tag] = []
                 self._fp_tasks[tag] = asyncio.create_task(self._run_fp(ws, tag))
+            self.frames[tag].append(raw)
             ws.q.put_nowait(raw)
 
         async def _run_fp(self, ws, tag):
@@ -183,7 +197,16 @@ def make_recorder_class():
                 await self._fp_battle_fn(ws, self._fp_format, None)
             except Exception as e:  # keep collecting even if one battle breaks
                 self.fp_errors += 1
-                print(f"[warn] Foul Play failed in {tag}: {type(e).__name__}: {e}", flush=True)
+                self.fp_failed.add(tag)
+                tb = traceback.extract_tb(e.__traceback__)[-1]
+                print(f"[warn] Foul Play failed in {tag}: {type(e).__name__}: {e} "
+                      f"({Path(tb.filename).name}:{tb.lineno} in {tb.name}); forfeiting that battle",
+                      flush=True)
+                # Nobody else would ever move for us, so the battle would hang forever. End it.
+                try:
+                    await self.ps_client.send_message("/forfeit", tag)
+                except Exception:
+                    pass
 
         # --- everything Foul Play wants to send passes through here ---
         async def on_fp_send(self, room: str, message_list: list):
@@ -191,7 +214,10 @@ def make_recorder_class():
             if first in ("gg", "hf") or first.startswith("/timer"):
                 return  # chat / timer: not part of the game
             if first.startswith("/choose") or first.startswith("/switch"):
-                self._record(room)
+                override = self._record(room)
+                if override is not None:  # DAgger: our network's action is played instead
+                    await self.ps_client.send_message(override, room)
+                    return
             m2 = message_list[1] if len(message_list) > 1 else None
             await self.ps_client.send_message(first, room, m2)
 
@@ -221,17 +247,29 @@ def make_recorder_class():
                         return a
             return None
 
+        def _student_action(self, battle, mask):
+            import torch
+
+            net, enc = self.student
+            o = torch.as_tensor(enc(battle), dtype=torch.float32).unsqueeze(0)
+            m = torch.as_tensor(mask, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                dist, _ = net(o, m)
+            return int(dist.probs.argmax(-1).item() if self.greedy else dist.sample().item())
+
         def _record(self, tag: str):
+            """Log (obs, mask, teacher choice, teacher policy). Returns the message to play
+            instead of the teacher's when DAgger mixing picks the student, else None."""
             battle = self.battles.get(tag)
             choice = LAST_CHOICE.pop(tag, None)
             policy = LAST_POLICY.pop(tag, None)
             if battle is None or choice is None or policy is None:
-                return  # e.g. forced single option: nothing was searched
+                return None  # e.g. forced single option: nothing was searched
             mask, legal = self._legal_actions(battle)
             act = self._map_choice(battle, choice, legal)
             if act is None:
                 self.unmapped += 1
-                return
+                return None
             pol = np.zeros(N_ACTIONS, dtype=np.float32)
             for k, v in policy.items():
                 a = self._map_choice(battle, k, legal)
@@ -239,12 +277,26 @@ def make_recorder_class():
                     pol[a] += v
             if pol.sum() <= 0:
                 self.unmapped += 1
-                return
+                return None
             pol /= pol.sum()
+
+            student_act, executed, override = -1, act, None
+            if self.student is not None:
+                student_act = self._student_action(battle, mask)
+                self.student_agree[0] += int(student_act == act)
+                self.student_agree[1] += 1
+                if random.random() >= self.beta and student_act in legal:
+                    executed = student_act
+                    order = PokemonEnv.action_to_order(np.int64(student_act), battle, strict=False)
+                    override = order.message
+            self.teacher_played[0] += int(executed == act)
+            self.teacher_played[1] += 1
             self.rows.append(dict(
-                obs=encode_battle(battle).astype(np.float32), mask=mask, act=act, policy=pol,
+                obs=self.encode(battle).astype(np.float32), mask=mask, act=act, policy=pol,
                 n_legal=len(legal), turn=int(battle.turn), tag=tag,
+                frame_idx=len(self.frames.get(tag, [])), executed=executed, student_act=student_act,
             ))
+            return override
 
     return FPRecorder
 
@@ -264,6 +316,11 @@ def save(path: Path, rows, results, meta):
         battle=np.array([bid[r["tag"]] for r in rows], dtype=np.int32),
         # +1 if Foul Play won that battle, -1 if it lost, 0 if unknown/tie
         outcome=np.array([results.get(r["tag"], 0) for r in rows], dtype=np.int8),
+        # replay support: decision r happened after `frame_idx` room messages of battle `tags[battle]`
+        frame_idx=np.array([r["frame_idx"] for r in rows], dtype=np.int32),
+        tags=np.array(tags),
+        executed=np.array([r["executed"] for r in rows], dtype=np.int16),      # action actually played
+        student_act=np.array([r["student_act"] for r in rows], dtype=np.int16),  # -1 if no student
         meta=np.array(str(meta)),
     )
 
@@ -280,6 +337,14 @@ async def main():
     ap.add_argument("--search-time-ms", type=int, default=100)
     ap.add_argument("--search-parallelism", type=int, default=1)
     ap.add_argument("--chunk", type=int, default=10, help="save after this many battles")
+    ap.add_argument("--encoder", choices=["v2", "v3"], default="v3",
+                    help="observation stored in the .npz (v3 adds Tera features). The raw messages are "
+                         "saved too, so any encoder can be rebuilt later with build_dataset.py")
+    ap.add_argument("--student", default=None,
+                    help="DAgger: checkpoint of OUR network; it plays some decisions and Foul Play labels them")
+    ap.add_argument("--beta", type=float, default=1.0,
+                    help="with --student: probability that Foul Play's action (not the student's) is played")
+    ap.add_argument("--greedy", action="store_true", help="student plays its argmax instead of sampling")
     ap.add_argument("--out", default="data/fp_data.npz")
     args = ap.parse_args()
 
@@ -297,15 +362,36 @@ async def main():
 
     opp_cls = {"random": RandomPlayer, "maxpower": MaxBasePowerPlayer,
                "heuristic": SimpleHeuristicsPlayer}[args.opponent]
+    from pokebot.encoder import OBS_DIM, OBS_DIM_V3, encoder_for_dim
+
+    encode = encoder_for_dim(OBS_DIM_V3 if args.encoder == "v3" else OBS_DIM)
+    student = None
+    if args.student:
+        try:
+            import torch
+        except ImportError:
+            sys.exit("--student needs torch in this environment: pip install torch (CPU build is fine)")
+        from pokebot.model import load_actor_critic
+
+        net, dim = load_actor_critic(args.student, N_ACTIONS)
+        student = (net, encoder_for_dim(dim))
+        print(f"[collect] student {args.student} (obs dim {dim}), beta={args.beta}"
+              f" ({'greedy' if args.greedy else 'sampled'})", flush=True)
     Rec = make_recorder_class()
     rec = Rec(account_configuration=AccountConfiguration(args.fp_name, None),
               battle_format=args.format, pokemon_battle_fn=pokemon_battle_fn, log_level=40,
-              fp_format=args.format)
+              fp_format=args.format, encode=encode, student=student, beta=args.beta, greedy=args.greedy)
     opp = opp_cls(account_configuration=AccountConfiguration(args.opp_name, None),
                   battle_format=args.format, log_level=40)
 
     meta = dict(search_time_ms=args.search_time_ms, search_parallelism=args.search_parallelism,
-                opponent=args.opponent, format=args.format, started=time.strftime("%Y-%m-%d %H:%M:%S"))
+                opponent=args.opponent, format=args.format, started=time.strftime("%Y-%m-%d %H:%M:%S"),
+                encoder=args.encoder, student=args.student, beta=args.beta if args.student else None,
+                fp_name=args.fp_name)
+    frames_path = out.with_suffix(".frames.jsonl.gz")
+    if frames_path.exists():  # the .npz is rewritten from scratch each run, so the raw messages must be too
+        print(f"[collect] removing the old {frames_path.name} (use a new --out to keep it)", flush=True)
+        frames_path.unlink()
     print(f"[collect] {args.battles} battles, Foul Play {args.search_time_ms} ms x "
           f"{args.search_parallelism} vs {args.opponent}; saving to {out}", flush=True)
 
@@ -314,14 +400,24 @@ async def main():
         n = min(args.chunk, args.battles - done)
         await rec.battle_against(opp, n_battles=n)
         done += n
-        results = {t: (1 if b.won else -1 if b.won is False else 0) for t, b in rec.battles.items()
-                   if b.finished}
+        # battles where Foul Play crashed ended in a forfeit: their result says nothing about its play
+        results = {t: (0 if t in rec.fp_failed else 1 if b.won else -1 if b.won is False else 0)
+                   for t, b in rec.battles.items() if b.finished}
         if rec.rows:
             save(out, rec.rows, results, meta)
+        # append the raw messages of the battles that finished in this chunk, then free the memory
+        with gzip.open(frames_path, "at") as fh:
+            for tag in [t for t in rec.frames if t in results]:
+                fh.write(json.dumps({"tag": tag, "user": args.fp_name, "format": args.format,
+                                     "frames": rec.frames.pop(tag)}) + "\n")
         w = sum(1 for v in results.values() if v == 1)
+        extra = ""
+        if student is not None:
+            a, n_ = rec.student_agree
+            extra = f", student agrees with Foul Play on {a / max(n_, 1):.3f}"
         print(f"[collect] {done}/{args.battles} battles, {len(rec.rows)} decisions, "
               f"Foul Play won {w}/{len(results)}, unmapped={rec.unmapped}, "
-              f"fp_errors={rec.fp_errors}, {time.time() - t0:.0f}s", flush=True)
+              f"fp_errors={rec.fp_errors}{extra}, {time.time() - t0:.0f}s", flush=True)
     print(f"[done] saved {out}", flush=True)
 
 

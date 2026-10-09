@@ -45,8 +45,13 @@ def raw_damage_frac(
     defender: Pokemon,
     attacker_own: bool,
     hits: float = 1.0,
+    stab_mod: float | None = None,
+    defender_types: list | None = None,
 ) -> float:
-    """Expected damage (average roll, no crit) as a fraction of defender max HP."""
+    """Expected damage (average roll, no crit) as a fraction of defender max HP.
+
+    `stab_mod` overrides the STAB multiplier and `defender_types` the defender's types
+    (both used to ask "what if it terastallized?")."""
     if bp <= 0 or category == MoveCategory.STATUS:
         return 0.0
     physical = category == MoveCategory.PHYSICAL
@@ -56,11 +61,16 @@ def raw_damage_frac(
     level = attacker.level or 100
     base = ((2 * level / 5 + 2) * bp * atk / max(dfn, 1.0)) / 50 + 2
     mod = 0.925  # average of the 0.85-1.0 random roll
-    if mtype is not None and mtype in attacker.types:
+    if stab_mod is not None:
+        mod *= stab_mod
+    elif mtype is not None and mtype in attacker.types:
         mod *= 1.5
     if mtype is not None:
         try:
-            mod *= float(defender.damage_multiplier(mtype))
+            if defender_types is not None:
+                mod *= type_mult(mtype, defender_types)
+            else:
+                mod *= float(defender.damage_multiplier(mtype))
         except Exception:
             pass
     if physical and attacker.status == Status.BRN:
@@ -69,13 +79,40 @@ def raw_damage_frac(
     return float(base * mod * hits / max(hp, 1.0))
 
 
-def move_damage_frac(move, attacker: Pokemon, defender: Pokemon, attacker_own: bool) -> float:
+def move_damage_frac(
+    move, attacker: Pokemon, defender: Pokemon, attacker_own: bool,
+    stab_mod: float | None = None, defender_types: list | None = None,
+) -> float:
     if move is None or defender is None or attacker is None:
         return 0.0
     hits = float(getattr(move, "expected_hits", 1) or 1)
     return raw_damage_frac(
-        float(move.base_power or 0), move.type, move.category, attacker, defender, attacker_own, hits
+        float(move.base_power or 0), move.type, move.category, attacker, defender, attacker_own, hits,
+        stab_mod=stab_mod, defender_types=defender_types,
     )
+
+
+def type_mult(mtype: PokemonType, types: list, gen: int = 9) -> float:
+    """Type-chart multiplier of `mtype` against a list of 1-2 defender types."""
+    from poke_env.data import GenData
+
+    ts = [t for t in types if t is not None]
+    if not ts:
+        return 1.0
+    chart = GenData.from_gen(gen).type_chart
+    return float(mtype.damage_multiplier(ts[0], ts[1] if len(ts) > 1 else None, type_chart=chart))
+
+
+def tera_stab(mtype: PokemonType | None, mon: Pokemon, tera_type: PokemonType | None = None) -> float | None:
+    """STAB multiplier of `mtype` if `mon` terastallized now (original types keep STAB;
+    matching the Tera type too gives 2.0). None when the Tera type is unknown."""
+    tt = tera_type if tera_type is not None else mon.tera_type
+    if tt is None or mtype is None:
+        return None
+    base = [t for t in mon.types if t is not None]
+    if mtype == tt:
+        return 2.0 if tt in base else 1.5
+    return 1.5 if mtype in base else 1.0
 
 
 def stab_threat(attacker: Pokemon, defender: Pokemon, attacker_own: bool) -> tuple[float, float]:

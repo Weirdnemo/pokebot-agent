@@ -11,8 +11,7 @@ import torch
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 
 from pokebot.env import make_env
-from pokebot.encoder import OBS_DIM
-from pokebot.model import ActorCritic
+from pokebot.model import load_actor_critic
 
 OPPONENTS = {
     "random": RandomPlayer,
@@ -21,8 +20,8 @@ OPPONENTS = {
 }
 
 
-def play(net, opp_cls, n, fmt, device):
-    env = make_env(opp_cls(start_listening=False), battle_format=fmt)
+def play(net, opp_cls, n, fmt, device, obs_dim):
+    env = make_env(opp_cls(start_listening=False), battle_format=fmt, obs_dim=obs_dim)
     wins = 0
     for _ in range(n):
         obs, _ = env.reset()
@@ -48,11 +47,9 @@ def main():
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = ActorCritic(OBS_DIM, 26 if "gen9" in args.format else 10).to(device)
-    net.load_state_dict(torch.load(args.ckpt, map_location=device))
-    net.eval()
+    net, obs_dim = load_actor_critic(args.ckpt, 26 if "gen9" in args.format else 10, device)
     for name, cls in OPPONENTS.items():
-        print(f"vs {name:10s} win rate: {play(net, cls, args.n, args.format, device):.2f}", flush=True)
+        print(f"vs {name:10s} win rate: {play(net, cls, args.n, args.format, device, obs_dim):.2f}", flush=True)
 
 
 if __name__ == "__main__":

@@ -10,23 +10,25 @@ from gymnasium.spaces import Box, Dict
 from poke_env.environment import SinglesEnv, SingleAgentWrapper
 from poke_env.player import Player, RandomPlayer
 
-from .encoder import OBS_DIM, encode_battle
+from .encoder import OBS_DIM, encoder_for_dim
 
 
 class PokemonEnv(SinglesEnv):
-    def __init__(self, **kwargs):
+    def __init__(self, obs_dim: int = OBS_DIM, **kwargs):
+        self.obs_dim = obs_dim
+        self._enc = encoder_for_dim(obs_dim)  # before super().__init__, which may embed a battle
         super().__init__(**kwargs)
         n_actions = self.action_spaces[self.possible_agents[0]].n
         space = Dict(
             {
-                "observation": Box(-1.0, 4.0, shape=(OBS_DIM,), dtype=np.float32),
+                "observation": Box(-1.0, 4.0, shape=(obs_dim,), dtype=np.float32),
                 "action_mask": Box(0, 1, shape=(n_actions,), dtype=np.int8),
             }
         )
         self.observation_spaces = {a: space for a in self.possible_agents}
 
     def embed_battle(self, battle):
-        return encode_battle(battle)
+        return self._enc(battle)
 
     def calc_reward(self, battle) -> float:
         # Light shaping on top of the +/-1 win signal. Anneal these toward 0
