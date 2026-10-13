@@ -61,6 +61,7 @@ def norm(s) -> str:
 _tls = threading.local()      # which battle the search thread is working on
 LAST_CHOICE: dict = {}        # battle_tag -> Foul Play's chosen option, e.g. "earthquake-tera"
 LAST_POLICY: dict = {}        # battle_tag -> {option: visit share}, over ALL options
+FP_BATTLES: dict = {}         # battle_tag -> Foul Play's own Battle object (to keep its memory honest in DAgger)
 
 
 def setup_foul_play(args):
@@ -107,6 +108,25 @@ def setup_foul_play(args):
 
     fp_base.find_best_move = find_best_move_logged
     fp_main.select_move_from_mcts_results = select_logged
+
+    # Keep a handle on Foul Play's real Battle object. In DAgger mode we sometimes play a different
+    # action than Foul Play chose, and Foul Play must be told (its `last_selected_move`), otherwise
+    # its speed inference later looks up e.g. the "move" "switchflamigo" and crashes.
+    import importlib
+
+    def _wrap_pick(orig_pick):
+        async def pick_logged(battle):
+            FP_BATTLES[battle.battle_tag] = battle
+            return await orig_pick(battle)
+        return pick_logged
+
+    for modname in ("fp.modes.random_battle", "fp.modes.standard_battle", "fp.modes.base"):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+        if hasattr(mod, "async_pick_move"):
+            mod.async_pick_move = _wrap_pick(mod.async_pick_move)
 
     from fp.run_battle import pokemon_battle
     return pokemon_battle, FoulPlayConfig
@@ -166,6 +186,32 @@ def make_recorder_class():
             self.unmapped = 0
             self.fp_errors = 0
             self.fp_failed: set[str] = set()  # battles where Foul Play crashed (outcome unreliable)
+            self.last_activity: dict[str, float] = {}  # battle tag -> time of the last message either way
+            self.stalled = 0
+            self.server_errors = 0
+
+        async def watchdog(self, idle_s: float = 120.0):
+            """Some battle stopped moving (a rejected choice, a lost message...). Show why, end it, go on."""
+            while True:
+                await asyncio.sleep(15)
+                now = time.time()
+                for tag, t in list(self.last_activity.items()):
+                    b = self.battles.get(tag)
+                    if b is None or b.finished:
+                        self.last_activity.pop(tag, None)
+                        continue
+                    if now - t > idle_s:
+                        self.stalled += 1
+                        self.fp_failed.add(tag)
+                        self.last_activity.pop(tag, None)
+                        tail = " || ".join(" / ".join(l for l in x.split("\n") if not l.startswith("|request|"))[-300:]
+                                           for x in self.frames.get(tag, [])[-4:])
+                        print(f"[warn] {tag} idle for {idle_s:.0f}s (turn {b.turn}); forfeiting it. "
+                              f"last messages: {tail}", flush=True)
+                        try:
+                            await self.ps_client.send_message("/forfeit", tag)
+                        except Exception:
+                            pass
 
         # poke-env must NOT choose moves: Foul Play does. Keep the method abstract-safe.
         def choose_move(self, battle):
@@ -180,6 +226,12 @@ def make_recorder_class():
             if not tag.startswith("battle"):
                 return
             raw = "\n".join("|".join(m) for m in split_messages)
+            self.last_activity[tag] = time.time()
+            if "|error|" in raw:
+                self.server_errors += 1
+                if self.server_errors <= 20:
+                    print(f"[warn] server rejected a choice in {tag}: "
+                          f"{[l for l in raw.split(chr(10)) if '|error|' in l][:2]}", flush=True)
             ws = self._fp_ws.get(tag)
             if ws is None:
                 if not (len(split_messages) > 1 and len(split_messages[1]) > 1
@@ -211,6 +263,7 @@ def make_recorder_class():
         # --- everything Foul Play wants to send passes through here ---
         async def on_fp_send(self, room: str, message_list: list):
             first = message_list[0] if message_list else ""
+            self.last_activity[room] = time.time()
             if first in ("gg", "hf") or first.startswith("/timer"):
                 return  # chat / timer: not part of the game
             if first.startswith("/choose") or first.startswith("/switch"):
@@ -257,6 +310,27 @@ def make_recorder_class():
                 dist, _ = net(o, m)
             return int(dist.probs.argmax(-1).item() if self.greedy else dist.sample().item())
 
+        def _tell_fp_what_we_played(self, tag, battle, executed, policy, legal):
+            """Make Foul Play's `last_selected_move` match the action actually sent."""
+            fp_battle = FP_BATTLES.get(tag)
+            if fp_battle is None:
+                return
+            exec_choice = None
+            for k in policy:  # reuse Foul Play's own option string when the search covered it
+                if self._map_choice(battle, k, legal) == executed:
+                    exec_choice = k
+                    break
+            if exec_choice is None:
+                msg = PokemonEnv.action_to_order(np.int64(executed), battle, strict=False).message
+                if executed < 6:
+                    exec_choice = "switch " + norm(list(battle.team.values())[executed].species)
+                else:
+                    exec_choice = msg.split("/choose move ")[-1].split()[0]
+            from fp.battle.state import LastUsedMove
+            old = fp_battle.user.last_selected_move
+            fp_battle.user.last_selected_move = LastUsedMove(
+                old.pokemon_name, exec_choice.removesuffix("-tera").removesuffix("-mega"), old.turn)
+
         def _record(self, tag: str):
             """Log (obs, mask, teacher choice, teacher policy). Returns the message to play
             instead of the teacher's when DAgger mixing picks the student, else None."""
@@ -289,6 +363,7 @@ def make_recorder_class():
                     executed = student_act
                     order = PokemonEnv.action_to_order(np.int64(student_act), battle, strict=False)
                     override = order.message
+                    self._tell_fp_what_we_played(tag, battle, executed, policy, legal)
             self.teacher_played[0] += int(executed == act)
             self.teacher_played[1] += 1
             self.rows.append(dict(
@@ -337,7 +412,7 @@ async def main():
     ap.add_argument("--search-time-ms", type=int, default=100)
     ap.add_argument("--search-parallelism", type=int, default=1)
     ap.add_argument("--chunk", type=int, default=10, help="save after this many battles")
-    ap.add_argument("--encoder", choices=["v2", "v3"], default="v3",
+    ap.add_argument("--encoder", choices=["v2", "v3", "v4"], default="v3",
                     help="observation stored in the .npz (v3 adds Tera features). The raw messages are "
                          "saved too, so any encoder can be rebuilt later with build_dataset.py")
     ap.add_argument("--student", default=None,
@@ -347,6 +422,8 @@ async def main():
     ap.add_argument("--greedy", action="store_true", help="student plays its argmax instead of sampling")
     ap.add_argument("--out", default="data/fp_data.npz")
     args = ap.parse_args()
+    if args.student:  # resolve now: setup_foul_play() changes the working directory
+        args.student = str(Path(args.student).resolve())
 
     # our package must be importable even though we chdir into the Foul Play folder
     here = Path(__file__).resolve().parent.parent
@@ -362,9 +439,9 @@ async def main():
 
     opp_cls = {"random": RandomPlayer, "maxpower": MaxBasePowerPlayer,
                "heuristic": SimpleHeuristicsPlayer}[args.opponent]
-    from pokebot.encoder import OBS_DIM, OBS_DIM_V3, encoder_for_dim
+    from pokebot.encoder import OBS_DIM, OBS_DIM_V3, OBS_DIM_V4, encoder_for_dim
 
-    encode = encoder_for_dim(OBS_DIM_V3 if args.encoder == "v3" else OBS_DIM)
+    encode = encoder_for_dim({"v2": OBS_DIM, "v3": OBS_DIM_V3, "v4": OBS_DIM_V4}[args.encoder])
     student = None
     if args.student:
         try:
@@ -396,6 +473,7 @@ async def main():
           f"{args.search_parallelism} vs {args.opponent}; saving to {out}", flush=True)
 
     done, t0 = 0, time.time()
+    watchdog_task = asyncio.create_task(rec.watchdog())
     while done < args.battles:
         n = min(args.chunk, args.battles - done)
         await rec.battle_against(opp, n_battles=n)
@@ -417,7 +495,7 @@ async def main():
             extra = f", student agrees with Foul Play on {a / max(n_, 1):.3f}"
         print(f"[collect] {done}/{args.battles} battles, {len(rec.rows)} decisions, "
               f"Foul Play won {w}/{len(results)}, unmapped={rec.unmapped}, "
-              f"fp_errors={rec.fp_errors}{extra}, {time.time() - t0:.0f}s", flush=True)
+              f"fp_errors={rec.fp_errors}, stalled={rec.stalled}{extra}, {time.time() - t0:.0f}s", flush=True)
     print(f"[done] saved {out}", flush=True)
 
 

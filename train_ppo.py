@@ -17,7 +17,7 @@ from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPl
 
 from pokebot.env import make_env
 from pokebot.encoder import OBS_DIM
-from pokebot.model import ActorCritic
+from pokebot.model import ActorCritic, pad_state_dict
 
 OPPONENTS = {
     "random": RandomPlayer,
@@ -62,6 +62,10 @@ def main():
     ap.add_argument("--resume", default=None)
     ap.add_argument("--kl-coef", type=float, default=0.0,
                     help="penalty on KL(policy || anchor); keeps PPO close to the BC policy (try 0.2)")
+    ap.add_argument("--obs-dim", type=int, default=0,
+                    help="observation size / encoder: 811 (v2), 967 (v3), 1025 (v4). 0 = same as --resume, "
+                         "or v2 when training from scratch. A larger value than the checkpoint's warm-starts "
+                         "it with zero-padded new inputs.")
     ap.add_argument("--anchor", default=None, help="frozen reference checkpoint (default: --resume)")
     ap.add_argument("--save-every", type=int, default=100_000,
                     help="also keep a snapshot step_<N>.pt this often, to pick the best one")
@@ -76,23 +80,29 @@ def main():
             return args.opponent
         return str(np.random.choice(list(weights), p=list(weights.values())))
 
+    resume_sd = torch.load(args.resume, map_location=device) if args.resume else None
+    hidden = resume_sd["body.0.weight"].shape[0] if resume_sd else 512
+    obs_dim = args.obs_dim or (resume_sd["body.0.weight"].shape[1] if resume_sd else OBS_DIM)
     cur = pick_opponent()
-    env = make_env(pool[cur], battle_format=args.format)
+    env = make_env(pool[cur], battle_format=args.format, obs_dim=obs_dim)
     by_opp = {name: [] for name in OPPONENTS}
     n_actions = env.action_space.n
+    print(f"observation size {obs_dim}, hidden {hidden}", flush=True)
 
-    net = ActorCritic(OBS_DIM, n_actions).to(device)
-    if args.resume:
-        net.load_state_dict(torch.load(args.resume, map_location=device))
+    net = ActorCritic(obs_dim, n_actions, hidden=hidden).to(device)
+    if resume_sd:
+        net.load_state_dict(pad_state_dict(resume_sd, obs_dim))
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     Path(args.out).mkdir(exist_ok=True)
 
-    ref = None
+    ref, ref_dim = None, obs_dim
     if args.kl_coef > 0:
         anchor = args.anchor or args.resume
         assert anchor, "--kl-coef needs --anchor or --resume"
-        ref = ActorCritic(OBS_DIM, n_actions).to(device)
-        ref.load_state_dict(torch.load(anchor, map_location=device))
+        ref_sd = torch.load(anchor, map_location=device)
+        ref_dim = ref_sd["body.0.weight"].shape[1]  # the anchor may use an older, shorter encoder
+        ref = ActorCritic(ref_dim, n_actions, hidden=ref_sd["body.0.weight"].shape[0]).to(device)
+        ref.load_state_dict(ref_sd)
         ref.eval()
         for p in ref.parameters():
             p.requires_grad_(False)
@@ -157,7 +167,7 @@ def main():
                 loss = pg + 0.5 * vl - args.ent * dist.entropy().mean()
                 if ref is not None:
                     with torch.no_grad():
-                        ref_dist, _ = ref(b_obs[mb], b_mask[mb])
+                        ref_dist, _ = ref(b_obs[mb][:, :ref_dim], b_mask[mb])
                     kl = (dist.probs * (dist.logits - ref_dist.logits)).masked_fill(b_mask[mb] < 0.5, 0.0).sum(-1).mean()
                     loss = loss + args.kl_coef * kl
                     kls.append(kl.item())

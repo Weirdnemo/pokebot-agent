@@ -65,6 +65,12 @@ def main():
         m = kind(tgt) == k
         if m.sum():
             print(f"  {KIND[k]:<10}", "  ".join(f"{KIND[j]} {100 * (kind(pred)[m] == j).mean():4.1f}%" for j in range(3)))
+    sw = kind(tgt) == 0
+    both = sw & (kind(pred) == 0)
+    if both.sum():
+        print(f"\nSwitch target: when Foul Play switches AND we predict a switch (n={both.sum()}), "
+              f"we pick the same mon {ok[both].mean() * 100:.1f}% of the time "
+              f"(random among legal switches: {np.mean([1 / max(int(m[:6].sum()), 1) for m in M[both]]) * 100:.1f}%)")
     print("\nBy how peaked Foul Play's search policy was (its top option's share):")
     for lo, hi in [(0, .4), (.4, .6), (.6, .8), (.8, 1.01)]:
         row(f"top share {lo:.1f}-{min(hi, 1):.1f}", (conf >= lo) & (conf < hi))

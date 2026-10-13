@@ -315,7 +315,20 @@ def encode_battle_v3(battle: Battle) -> np.ndarray:
     return np.concatenate([encode_battle(battle), encode_tera(battle)]).astype(np.float32)
 
 
-ENCODERS = {OBS_DIM: encode_battle, OBS_DIM_V3: encode_battle_v3}
+# ---------------------------------------------------------------------------------------
+# v4: v3 + set-pool beliefs about the opponent (see beliefs.py): per own slot worst-case /
+# expected incoming damage from the opponent's possible moves, plus Tera-type belief.
+# ---------------------------------------------------------------------------------------
+from .beliefs import BELIEF_DIM, encode_belief  # noqa: E402
+
+OBS_DIM_V4 = OBS_DIM_V3 + BELIEF_DIM
+
+
+def encode_battle_v4(battle: Battle) -> np.ndarray:
+    return np.concatenate([encode_battle_v3(battle), encode_belief(battle)]).astype(np.float32)
+
+
+ENCODERS = {OBS_DIM: encode_battle, OBS_DIM_V3: encode_battle_v3, OBS_DIM_V4: encode_battle_v4}
 
 
 def encoder_for_dim(dim: int):

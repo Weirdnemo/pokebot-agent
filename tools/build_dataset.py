@@ -1,7 +1,7 @@
 """Rebuild a decision dataset with any observation encoder from the raw room messages
 saved by tools/collect_foulplay.py (data/<name>.npz + data/<name>.frames.jsonl.gz).
 
-    python tools/build_dataset.py --in data/fp_x.npz --encoder v3 --out data/fp_x_v3.npz
+    python tools/build_dataset.py --in data/fp_x.npz --encoder v4 --out data/fp_x_v4.npz
 
 Each battle's messages are replayed through poke-env's own Battle object exactly as the live
 player processed them, and the new encoder is applied at the recorded decision points. The
@@ -23,7 +23,9 @@ import numpy as np
 import orjson
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pokebot.encoder import OBS_DIM, OBS_DIM_V3, encoder_for_dim  # noqa: E402
+from pokebot.encoder import OBS_DIM, OBS_DIM_V3, OBS_DIM_V4, encoder_for_dim  # noqa: E402
+
+DIMS = {"v2": OBS_DIM, "v3": OBS_DIM_V3, "v4": OBS_DIM_V4}
 
 
 def replay_battle(frames, username, decisions, encode, get_mask):
@@ -62,7 +64,7 @@ def replay_battle(frames, username, decisions, encode, get_mask):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", required=True, help="the .npz written by collect_foulplay.py")
-    ap.add_argument("--encoder", choices=["v2", "v3"], default="v3")
+    ap.add_argument("--encoder", choices=["v2", "v3", "v4"], default="v3")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -72,14 +74,14 @@ def main():
     d = dict(np.load(inp, allow_pickle=False))
     meta = ast.literal_eval(str(d["meta"]))
     frames_file = inp.with_suffix(".frames.jsonl.gz")
-    encode = encoder_for_dim(OBS_DIM_V3 if args.encoder == "v3" else OBS_DIM)
+    encode = encoder_for_dim(DIMS[args.encoder])
 
     by_tag: dict[str, list] = {}
     for i, (b, fi) in enumerate(zip(d["battle"], d["frame_idx"])):
         by_tag.setdefault(str(d["tags"][b]), []).append((i, int(fi)))
 
     n = len(d["obs"])
-    new_obs = np.zeros((n, OBS_DIM_V3 if args.encoder == "v3" else OBS_DIM), np.float32)
+    new_obs = np.zeros((n, DIMS[args.encoder]), np.float32)
     done = np.zeros(n, bool)
     mask_ok = obs_ok = 0
     nb = 0

@@ -38,3 +38,16 @@ def load_actor_critic(path: str, n_actions: int = 26, device="cpu"):
     net.load_state_dict(sd)
     net.eval()
     return net, obs_dim
+
+
+def pad_state_dict(sd: dict, obs_dim: int) -> dict:
+    """Warm start from a checkpoint with fewer input features: the new input columns start at zero
+    (so the network initially behaves exactly like the old one). Encoders are prefix-compatible
+    (v2 is the first 811 values of v3, which are the first 967 of v4)."""
+    sd = dict(sd)
+    w = sd["body.0.weight"]
+    if w.shape[1] > obs_dim:
+        raise ValueError(f"checkpoint has {w.shape[1]} inputs, more than the requested {obs_dim}")
+    if w.shape[1] < obs_dim:
+        sd["body.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], obs_dim - w.shape[1], dtype=w.dtype)], 1)
+    return sd
